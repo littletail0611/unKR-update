@@ -7,3 +7,4 @@ from .UKGsE import UKGsE
 from .GTransE import GTransE
 from .UPGAT import UPGAT
 from .SSCDL import ssCDL
+from .updater_adapter import UnKRModelAdapter
