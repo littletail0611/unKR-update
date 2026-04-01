@@ -18,10 +18,9 @@
     2. 初始化指定的 unKR 模型并加载预训练权重（可选）。
     3. 用 UnKRModelAdapter 包装模型，统一暴露 entity_emb / relation_emb /
        mlp_mean / mlp_var / forward / predict 接口。
-    4. 在 Base 数据上预训练适配器的 MLP 预测头（冻结原嵌入）。
-    5. 初始化 UnifiedConfidenceUpdater（解冻嵌入）。
-    6. 以 single-batch 或 streaming 模式调用 updater.step() 执行增量更新。
-    7. 打印更新摘要（新事实平均置信度、全局平均变动、局部最大变动、受影响旧事实数）。
+    4. 初始化 UnifiedConfidenceUpdater。
+    5. 以 single-batch 或 streaming 模式调用 updater.step() 执行增量更新。
+    6. 打印更新摘要（新事实平均置信度、全局平均变动、局部最大变动、受影响旧事实数）。
 """
 
 import argparse
@@ -63,14 +62,6 @@ def get_args():
     parser.add_argument("--dropout_rate", type=float, default=0.3)
     parser.add_argument("--num_pseudo",   type=int,   default=10,
                         help="UPGAT 专用：伪邻居预测时每对 (head, relation) 保留的候选尾实体数。")
-
-    # ------------------------------------------------------------------
-    # MLP 预训练（适配器的预测头）
-    # ------------------------------------------------------------------
-    parser.add_argument("--mlp_pretrain_epochs", type=int, default=20,
-                        help="在 Base 数据上预训练 MLP 预测头的轮数。")
-    parser.add_argument("--mlp_pretrain_lr", type=float, default=1e-3)
-    parser.add_argument("--mlp_pretrain_batch_size", type=int, default=512)
 
     # ------------------------------------------------------------------
     # 增量更新超参数（与 update 库 config.py 对齐）
@@ -209,20 +200,7 @@ def run(args):
     print(f"\n>>> 适配器初始化成功（底层模型: {args.model_name}）。")
 
     # ------------------------------------------------------------------
-    # 4. 在 Base 数据上预训练 MLP 预测头
-    # ------------------------------------------------------------------
-    print(f"\n>>> 开始预训练 MLP 预测头（epochs={args.mlp_pretrain_epochs}）...")
-    adapter.train_mlp_heads(
-        dataset=dataset,
-        epochs=args.mlp_pretrain_epochs,
-        lr=args.mlp_pretrain_lr,
-        batch_size=args.mlp_pretrain_batch_size,
-        device=args.device,
-    )
-    print(">>> MLP 预测头预训练完成。")
-
-    # ------------------------------------------------------------------
-    # 5. 初始化 UnifiedConfidenceUpdater
+    # 4. 初始化 UnifiedConfidenceUpdater
     # ------------------------------------------------------------------
     from unKR.updater import UnifiedConfidenceUpdater
 
@@ -238,7 +216,7 @@ def run(args):
     print("\n>>> UnifiedConfidenceUpdater 初始化完成。")
 
     # ------------------------------------------------------------------
-    # 6. 执行增量更新
+    # 5. 执行增量更新
     # ------------------------------------------------------------------
     mode_str = "Single-batch (one-shot)" if args.single_batch else "Streaming (mini-batch)"
     print(f"\n>>> 启动增量更新 [模式: {mode_str}]...")
