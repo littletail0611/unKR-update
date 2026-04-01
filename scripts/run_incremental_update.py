@@ -9,18 +9,22 @@
     python scripts/run_incremental_update.py \\
         --data_dir  data/CN15K \\
         --model_name UKGE \\
+        --yaml_config config/cn15k/UKGE_cn15k.yaml \\
         --unkr_checkpoint checkpoints/ukge_cn15k.ckpt \\
         --emb_dim 128 \\
         --device cpu
 
 流程说明：
     1. 加载 IncrementalUKGDataset（base/inc 两阶段数据格式）。
-    2. 初始化指定的 unKR 模型并加载预训练权重（可选）。
-    3. 用 UnKRModelAdapter 包装模型，统一暴露 entity_emb / relation_emb /
+    2. 从 YAML 配置文件读取模型参数（--yaml_config 指定），初始化指定的 unKR 模型。
+    3. 若提供 --unkr_checkpoint，加载预训练权重（自动处理 Lightning 前缀和
+       嵌入尺寸不匹配：base checkpoint 的嵌入行数少于当前实体总数时，
+       多余的行用均值初始化）。
+    4. 用 UnKRModelAdapter 包装模型，统一暴露 entity_emb / relation_emb /
        mlp_mean / mlp_var / forward / predict 接口。
-    4. 初始化 UnifiedConfidenceUpdater。
-    5. 以 single-batch 或 streaming 模式调用 updater.step() 执行增量更新。
-    6. 打印更新摘要（新事实平均置信度、全局平均变动、局部最大变动、受影响旧事实数）。
+    5. 初始化 UnifiedConfidenceUpdater。
+    6. 以 single-batch 或 streaming 模式调用 updater.step() 执行增量更新。
+    7. 打印更新摘要（新事实平均置信度、全局平均变动、局部最大变动、受影响旧事实数）。
 """
 
 import argparse
@@ -55,6 +59,12 @@ def get_args():
                         choices=["UKGE", "UKGE_PSL", "BEUrRE", "FocusE",
                                  "GTransE", "PASSLEAF", "UKGsE", "UPGAT", "SSCDL"],
                         help="unKR 模型名称。")
+    parser.add_argument("--yaml_config", type=str, default=None,
+                        help=(
+                            "unKR YAML 配置文件路径（例如 config/cn15k/UKGE_cn15k.yaml）。"
+                            "文件中的参数将作为模型初始化的默认值，"
+                            "命令行参数（num_ent、num_rel、emb_dim、gpu）会覆盖 YAML 中的同名参数。"
+                        ))
     parser.add_argument("--unkr_checkpoint", type=str, default=None,
                         help="预训练权重路径（.ckpt 或 .pth），可选。")
     parser.add_argument("--emb_dim",    type=int, default=128,
@@ -105,44 +115,116 @@ def get_args():
 
 
 def build_model(model_name: str, num_ent: int, num_rel: int, args):
-    """根据模型名称实例化对应的 unKR 模型。"""
+    """根据模型名称和配置实例化对应的 unKR 模型。
+
+    参数加载优先级：
+        命令行关键参数（num_ent、num_rel、emb_dim、gpu）> YAML 配置文件。
+
+    YAML 配置文件提供了 GTransE（margin、alpha）、FocusE（margin、base_model）、
+    BEUrRE（GUMBEL_BETA、num_neg）等模型初始化所需的特有参数。
+    若不提供 --yaml_config，则这些模型在实例化时可能因缺少参数而报 AttributeError。
+    """
     import importlib
+    try:
+        import yaml
+        _has_yaml = True
+    except ImportError:
+        _has_yaml = False
+
+    # 从 YAML 配置文件加载模型参数（作为基础参数集）
+    model_params: dict = {}
+    yaml_path = getattr(args, "yaml_config", None)
+    if yaml_path:
+        if not os.path.exists(yaml_path):
+            print(
+                f"警告: 未找到 YAML 配置文件 {yaml_path}。"
+                f"GTransE/FocusE/BEUrRE 等模型需要 YAML 提供 margin、alpha、"
+                f"GUMBEL_BETA 等参数，缺少时将引发 AttributeError。"
+            )
+        elif not _has_yaml:
+            print("警告: 未安装 PyYAML，无法加载 YAML 配置（pip install pyyaml）。")
+        else:
+            print(f">>> 加载 YAML 配置: {yaml_path}")
+            with open(yaml_path, "r", encoding="utf-8") as f:
+                yaml_cfg = yaml.safe_load(f) or {}
+            model_params.update(yaml_cfg)
+
+    # 命令行关键参数覆盖 YAML（确保数据集实际的实体/关系数优先）
+    model_params.update({
+        "num_ent":    num_ent,
+        "num_rel":    num_rel,
+        "emb_dim":    args.emb_dim,
+        "gpu":        args.device,
+        "num_pseudo": getattr(args, "num_pseudo", 10),
+    })
+
+    model_args = argparse.Namespace(**model_params)
 
     module = importlib.import_module(f"unKR.model.UKGModel.{model_name}")
     model_cls = getattr(module, model_name)
-
-    # 构造最小化 args 命名空间，确保模型能正常初始化
-    model_args = argparse.Namespace(
-        num_ent=num_ent,
-        num_rel=num_rel,
-        emb_dim=args.emb_dim,
-        gpu=args.device,
-        # UPGAT 专用参数：伪邻居预测时每对 (h, r) 保留的候选尾实体数
-        num_pseudo=getattr(args, "num_pseudo", 10),
-    )
     return model_cls(model_args)
 
 
 def load_checkpoint(model, ckpt_path: str, device: str):
-    """加载预训练权重（支持 PyTorch Lightning .ckpt 和普通 .pth 格式）。"""
+    """加载预训练权重（支持 PyTorch Lightning .ckpt 和普通 .pth 格式）。
+
+    自动处理：
+    1. Lightning checkpoint 格式：权重存储在 ``state_dict`` 键下，且键名可能携带
+       ``"model."`` 或 ``"lit_model.model."`` 前缀，本函数统一去除。
+    2. 嵌入尺寸不匹配：预训练模型仅含 base_num_ent 个实体的嵌入，而当前模型（已含
+       增量新实体）的嵌入表行数更多。对于尺寸不匹配的矩阵参数，将 checkpoint 的基础
+       行复制到模型对应位置，新增行则用基础行均值初始化。
+    """
     print(f">>> 加载预训练权重: {ckpt_path}")
-    state_dict = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device)
 
-    # PyTorch Lightning checkpoint 的权重存储在 "state_dict" 键下，
-    # 且键名带有 "model." 前缀，需要去除。
-    if "state_dict" in state_dict:
-        raw = state_dict["state_dict"]
-        cleaned = {}
+    # 处理 PyTorch Lightning checkpoint 格式
+    state_dict = ckpt
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        raw = ckpt["state_dict"]
+        state_dict = {}
         for k, v in raw.items():
-            new_k = k[len("model."):] if k.startswith("model.") else k
-            cleaned[new_k] = v
-        state_dict = cleaned
+            if k.startswith("lit_model.model."):
+                state_dict[k[len("lit_model.model."):]] = v
+            elif k.startswith("model."):
+                state_dict[k[len("model."):]] = v
+            else:
+                state_dict[k] = v
 
+    # 先用 strict=False 加载，处理多余/缺失键
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    # 处理矩阵参数尺寸不匹配：将 checkpoint 基础行复制到模型中，新行用均值初始化
+    all_model_tensors = {**dict(model.named_parameters()), **dict(model.named_buffers())}
+    for key, ckpt_tensor in state_dict.items():
+        if key not in all_model_tensors:
+            continue
+        model_tensor = all_model_tensors[key]
+        if model_tensor.shape == ckpt_tensor.shape:
+            continue  # 尺寸匹配，已在 load_state_dict 中正确加载
+        if model_tensor.dim() < 2 or model_tensor.shape[0] <= ckpt_tensor.shape[0]:
+            continue  # 非矩阵参数，或模型比 checkpoint 小（不支持缩减）
+
+        # 模型的行数多于 checkpoint（预训练仅含 base 实体）
+        n_base = ckpt_tensor.shape[0]
+        n_model = model_tensor.shape[0]
+        ckpt_data = ckpt_tensor.to(device)
+        mean_row = ckpt_data.mean(dim=0)
+        n_new = n_model - n_base
+
+        with torch.no_grad():
+            model_tensor.data[:n_base] = ckpt_data
+            model_tensor.data[n_base:] = mean_row.unsqueeze(0).expand(n_new, -1)
+        print(
+            f"  嵌入扩展: {key} {list(ckpt_tensor.shape)} → {list(model_tensor.shape)}"
+            f"（新增 {n_new} 行使用均值初始化）"
+        )
+
     if missing:
-        print(f"  警告: 以下键缺失（将使用随机初始化）: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+        print(f"  警告: 缺失键（参数保留为模型初始化值）: {missing[:5]}"
+              f"{'...' if len(missing) > 5 else ''}")
     if unexpected:
-        print(f"  警告: 以下键未使用: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+        print(f"  警告: 未使用键: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
     return model
 
 
@@ -167,7 +249,7 @@ def run(args):
           f"Base 实体数={dataset.base_num_ent}")
 
     # ------------------------------------------------------------------
-    # 2. 初始化 unKR 模型
+    # 2. 初始化 unKR 模型（含完整 num_ent，覆盖增量新实体）
     # ------------------------------------------------------------------
     unkr_model = build_model(
         args.model_name,
@@ -178,6 +260,9 @@ def run(args):
     unkr_model = unkr_model.to(args.device)
 
     if args.unkr_checkpoint and os.path.exists(args.unkr_checkpoint):
+        # load_checkpoint 内部会自动处理：
+        #   - Lightning 前缀（model. / lit_model.model.）
+        #   - 嵌入尺寸不匹配（base checkpoint 行数 < 当前模型行数）
         unkr_model = load_checkpoint(unkr_model, args.unkr_checkpoint, args.device)
     else:
         if args.unkr_checkpoint:
@@ -198,6 +283,11 @@ def run(args):
         dropout_rate=args.dropout_rate,
     ).to(args.device)
     print(f"\n>>> 适配器初始化成功（底层模型: {args.model_name}）。")
+
+    # 若适配器的嵌入表仍小于 dataset.num_ent（例如 build_model 中未完全扩展），
+    # 显式调用 expand_embedding 补全。
+    if adapter.entity_emb.weight.shape[0] < dataset.num_ent:
+        adapter.expand_embedding(dataset.num_ent, dataset.num_rel)
 
     # ------------------------------------------------------------------
     # 4. 初始化 UnifiedConfidenceUpdater
