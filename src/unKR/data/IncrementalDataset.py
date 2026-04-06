@@ -147,7 +147,6 @@ class IncrementalUKGDataset:
                     if is_train:
                         self.belief_state[(h_id, r_id, t_id)] = c_val
                         if self.add_inverse:
-                            r_inv_id = r_id + 1
                             self.belief_state[(t_id, r_inv_id, h_id)] = c_val
 
                 elif len(parts) == 3 and is_inc:
