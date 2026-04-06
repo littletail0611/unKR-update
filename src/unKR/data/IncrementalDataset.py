@@ -21,17 +21,22 @@ class IncrementalUKGDataset:
 
     属性：
         data_dir: 数据集根目录路径。
+        add_inverse: 是否为每个关系自动注册反向关系并生成反向边。
+            - True（默认）：为 GNN 模型生成双向边，每个关系额外注册 ``_inv`` 反向关系。
+            - False：纯嵌入模型（UKGE 等）场景，不生成反向关系和反向边，
+              避免 checkpoint 加载时出现无意义的嵌入扩展。
         ent2id: 实体名称到整数 ID 的映射。
         rel2id: 关系名称到整数 ID 的映射。
         num_ent: 当前实体总数（含增量阶段新实体）。
-        num_rel: 当前关系总数（含反向关系）。
+        num_rel: 当前关系总数（add_inverse=True 时含反向关系）。
         belief_state: 全局置信度状态字典，键为 (h_id, r_id, t_id) 三元组。
         new_entities: 增量阶段新出现实体的 ID 集合（OOKB 实体）。
         base_num_ent: Base 阶段的实体数量。
     """
 
-    def __init__(self, data_dir: str):
+    def __init__(self, data_dir: str, add_inverse: bool = True):
         self.data_dir = data_dir
+        self.add_inverse = add_inverse
 
         self.ent2id: dict = {}
         self.rel2id: dict = {}
@@ -74,13 +79,19 @@ class IncrementalUKGDataset:
         return self.ent2id[ent]
 
     def _get_rel_id(self, rel: str) -> int:
-        """获取关系 ID，同时自动为其注册一个反向关系 ID（命名约定：原关系名 + "_inv"）。"""
+        """获取关系 ID。
+
+        当 ``add_inverse=True`` 时，同时自动为其注册一个反向关系 ID
+        （命名约定：原关系名 + ``_inv``）。
+        当 ``add_inverse=False`` 时，只分配正向关系 ID，不注册反向关系。
+        """
         if rel not in self.rel2id:
             self.rel2id[rel] = self.num_rel
             self.num_rel += 1
-            inv_rel = rel + "_inv"
-            self.rel2id[inv_rel] = self.num_rel
-            self.num_rel += 1
+            if self.add_inverse:
+                inv_rel = rel + "_inv"
+                self.rel2id[inv_rel] = self.num_rel
+                self.num_rel += 1
         return self.rel2id[rel]
 
     # ------------------------------------------------------------------
@@ -96,7 +107,8 @@ class IncrementalUKGDataset:
         非增量文件（base）仍要求 4 列。
         belief_state 仅在增量训练文件中由有标注事实填充。
 
-        同时为每条正向边自动生成对应的反向边。
+        当 ``add_inverse=True`` 时，为每条正向边自动生成对应的反向边；
+        当 ``add_inverse=False`` 时，不生成反向边。
         """
         triplets = []
         filepath = None
@@ -128,12 +140,14 @@ class IncrementalUKGDataset:
                     c_val = float(parts[3])
 
                     triplets.append((h_id, r_id, t_id, c_val))
-                    r_inv_id = r_id + 1
-                    triplets.append((t_id, r_inv_id, h_id, c_val))
+                    if self.add_inverse:
+                        r_inv_id = r_id + 1
+                        triplets.append((t_id, r_inv_id, h_id, c_val))
 
                     if is_train:
                         self.belief_state[(h_id, r_id, t_id)] = c_val
-                        self.belief_state[(t_id, r_inv_id, h_id)] = c_val
+                        if self.add_inverse:
+                            self.belief_state[(t_id, r_inv_id, h_id)] = c_val
 
                 elif len(parts) == 3 and is_inc:
                     h_id = self._get_ent_id(parts[0], is_inc)
@@ -141,8 +155,9 @@ class IncrementalUKGDataset:
                     t_id = self._get_ent_id(parts[2], is_inc)
 
                     triplets.append((h_id, r_id, t_id, None))
-                    r_inv_id = r_id + 1
-                    triplets.append((t_id, r_inv_id, h_id, None))
+                    if self.add_inverse:
+                        r_inv_id = r_id + 1
+                        triplets.append((t_id, r_inv_id, h_id, None))
 
         return triplets
 

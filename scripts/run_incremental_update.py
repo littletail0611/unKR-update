@@ -334,7 +334,7 @@ def run(args):
     print(f"运算设备:   {args.device}")
     print(f"{'='*60}\n")
 
-    dataset = IncrementalUKGDataset(args.data_dir)
+    dataset = IncrementalUKGDataset(args.data_dir, add_inverse=False)
     print(f"\n数据集摘要: 实体总数={dataset.num_ent}, 关系总数={dataset.num_rel}, "
           f"Base 实体数={dataset.base_num_ent}")
 
